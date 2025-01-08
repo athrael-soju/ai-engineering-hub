@@ -1,157 +1,220 @@
-# Adapted from https://docs.streamlit.io/knowledge-base/tutorials/build-conversational-apps#build-a-simple-chatbot-gui-with-streaming
 import os
-import openai
-import base64
 import gc
-import random
-import tempfile
-import time
 import uuid
+import base64
+import tempfile
 
-from IPython.display import Markdown, display
+import docx2txt
+import streamlit as st
 from dotenv import load_dotenv
+
+# For reading PDF via llama_index's SimpleDirectoryReader
 from llama_index.core import SimpleDirectoryReader
+
+# Your existing code in rag_code.py
 from rag_code import EmbedData, QdrantVDB_QB, Retriever, RAG
 
-import streamlit as st
-
+############################
+# SESSION & ENV SETUP
+############################
 if "id" not in st.session_state:
     st.session_state.id = uuid.uuid4()
     st.session_state.file_cache = {}
 
-session_id = st.session_state.id
-collection_name = "chat with docs"
-batch_size = 32
-
 load_dotenv()
+
+collection_name = "chat_with_docs"
+batch_size = 32
 
 def reset_chat():
     st.session_state.messages = []
     st.session_state.context = None
     gc.collect()
 
+############################
+# READING FILE HELPERS
+############################
+def read_pdf_file(file):
+    """
+    Reads PDF data from an uploaded file-like object using 
+    LlamaIndex's SimpleDirectoryReader. We must temporarily 
+    save the file to disk so the reader can process it.
+    """
+    text = ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file.read())
+        tmp.flush()
+        tmp_name = tmp.name
 
-def display_pdf(file):
-    # Opening file from file path
-
-    st.markdown("### PDF Preview")
-    base64_pdf = base64.b64encode(file.read()).decode("utf-8")
-
-    # Embedding PDF in HTML
-    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" width="400" height="100%" type="application/pdf"
-                        style="height:100vh; width:100%"
-                    >
-                    </iframe>"""
-
-    # Displaying File
-    st.markdown(pdf_display, unsafe_allow_html=True)
-
-
-with st.sidebar:
-    st.header(f"Add your documents!")
-    
-    uploaded_file = st.file_uploader("Choose your `.pdf` file", type="pdf")
-
-    if uploaded_file:
+    try:
+        loader = SimpleDirectoryReader(
+            input_files=[tmp_name], 
+            required_exts=[".pdf"],
+            recursive=False
+        )
+        docs = loader.load_data()
+        for d in docs:
+            text += d.text + "\n"
+    except Exception as e:
+        st.write(f"Error reading PDF: {e}")
+    finally:
+        # Clean up temp file
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                file_path = os.path.join(temp_dir, uploaded_file.name)
-                
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getvalue())
-                
-                file_key = f"{session_id}-{uploaded_file.name}"
-                st.write("Indexing your document...")
+            os.remove(tmp_name)
+        except:
+            pass
+    return text
 
-                if file_key not in st.session_state.get('file_cache', {}):
+def read_docx_file(file):
+    """
+    Reads DOCX using docx2txt. 
+    Again, we must temporarily save the bytes to disk.
+    """
+    text = ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(file.read())
+        tmp.flush()
+        tmp_name = tmp.name
 
-                    if os.path.exists(temp_dir):
-                            loader = SimpleDirectoryReader(
-                                input_dir = temp_dir,
-                                required_exts=[".pdf"],
-                                recursive=True
-                            )
-                    else:    
-                        st.error('Could not find the file you uploaded, please check again...')
-                        st.stop()
-                    
-                    docs = loader.load_data()
-                    documents = [doc.text for doc in docs]
+    try:
+        text = docx2txt.process(tmp_name)
+    except Exception as e:
+        st.write(f"Error reading DOCX: {e}")
+    finally:
+        try:
+            os.remove(tmp_name)
+        except:
+            pass
+    return text
 
-                    # embed data    
-                    embeddata = EmbedData(embed_model_name="BAAI/bge-large-en-v1.5", batch_size=batch_size)
-                    embeddata.embed(documents)
+def read_txt_file(file):
+    """
+    Read raw text from a .txt file. 
+    """
+    try:
+        # file_uploader returns a BytesIO, so decode
+        text = file.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        st.write(f"Error reading TXT: {e}")
+        text = ""
+    return text
 
-                    # set up vector database
-                    qdrant_vdb = QdrantVDB_QB(collection_name=collection_name,
-                                              batch_size=batch_size,
-                                              vector_dim=1024)
-                    qdrant_vdb.define_client()
-                    qdrant_vdb.create_collection()
-                    qdrant_vdb.ingest_data(embeddata=embeddata)
+def display_text_preview(text, max_chars=300):
+    """
+    Show a short snippet of text to the user
+    """
+    st.markdown(f"```\n{text[:max_chars]}\n... (truncated) ...\n```")
 
-                    # set up retriever
-                    retriever = Retriever(vector_db=qdrant_vdb, embeddata=embeddata)
+############################
+# APP UI
+############################
 
-                    # set up rag
-                    query_engine = RAG(retriever=retriever, llm_name="Meta-Llama-3.3-70B-Instruct")
+st.title("Folder Simulation with Multi-File Upload (One-by-one Processing)")
+st.sidebar.button("Clear ↺", on_click=reset_chat)
 
-                    st.session_state.file_cache[file_key] = query_engine
+# Step 1: Let user pick multiple files from a folder
+uploaded_files = st.file_uploader(
+    "Select multiple PDF/DOCX/TXT files (Ctrl+Click or Shift+Click to select many)",
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=True
+)
 
-                else:
-                    query_engine = st.session_state.file_cache[file_key]
+if uploaded_files:
+    st.write(f"You've selected {len(uploaded_files)} file(s). We'll index them one by one.")
 
-                # Inform the user that the file is processed and Display the PDF uploaded
-                st.success("Ready to Chat!")
-                display_pdf(uploaded_file)
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            st.stop()     
+    # Create a Qdrant collection
+    qdrant_vdb = QdrantVDB_QB(
+        collection_name=collection_name,
+        batch_size=batch_size,
+        vector_dim=1024  # Adjust if your embed model uses dimension 1024
+    )
+    qdrant_vdb.define_client()
+    qdrant_vdb.create_collection()
 
-col1, col2 = st.columns([6, 1])
+    # Create embedding object
+    embedder = EmbedData(embed_model_name="BAAI/bge-large-en-v1.5", batch_size=batch_size)
 
-with col1:
-    st.header(f"Fastest RAG Stack with SambaNova and Llama-3.3")
+    # Process each file in a loop
+    for i, file in enumerate(uploaded_files, start=1):
+        st.write(f"**[{i}/{len(uploaded_files)}]** Processing file: `{file.name}`")
+        text_content = ""
+        # Read file content based on extension
+        if file.name.lower().endswith(".pdf"):
+            text_content = read_pdf_file(file)
+        elif file.name.lower().endswith(".docx"):
+            text_content = read_docx_file(file)
+        elif file.name.lower().endswith(".txt"):
+            text_content = read_txt_file(file)
 
-with col2:
-    st.button("Clear ↺", on_click=reset_chat)
+        # If there's no text, skip
+        if not text_content.strip():
+            st.write("No text extracted. Skipping...")
+            continue
 
-# Initialize chat history
+        st.write("Here's a snippet of extracted text:")
+        display_text_preview(text_content)
+
+        # Embed the text (just one chunk - the entire text)
+        st.write("Generating embeddings...")
+        embeddings = embedder.generate_embedding([text_content])
+
+        # Ingest into Qdrant
+        st.write("Ingesting into Qdrant collection...")
+        qdrant_vdb.ingest_file_data([text_content], embeddings)
+
+        st.write(f"Done with: {file.name}")
+        st.write("---")
+
+    # Once all are ingested, build the RAG pipeline
+    retriever = Retriever(vector_db=qdrant_vdb, embeddata=embedder)
+    query_engine = RAG(
+        retriever=retriever,
+        llm_name="Meta-Llama-3.3-70B-Instruct"
+    )
+
+    # Cache the engine
+    st.session_state.file_cache["combined_engine"] = query_engine
+    st.success("All selected documents indexed successfully!")
+
+# Chat section
+st.write("## Chat Interface")
+
 if "messages" not in st.session_state:
     reset_chat()
 
-
-# Display chat messages from history on app rerun
+# Display chat messages so far
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-
-# Accept user input
-if prompt := st.chat_input("What's up?"):
-    # Add user message to chat history
+# Accept user query
+prompt = st.chat_input("Ask a question about your docs...")
+if prompt:
+    # Show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
-    # Display user message in chat message container
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-        
-        # Simulate stream of response with milliseconds delay
-        streaming_response = query_engine.query(prompt)
-        
-        for chunk in streaming_response:
-            try:
-                new_text = chunk.raw["choices"][0]["delta"]["content"]
-                full_response += new_text
-                message_placeholder.markdown(full_response + "▌")
-            except:
-                pass
+    # Retrieve query engine
+    query_engine = st.session_state.file_cache.get("combined_engine", None)
 
-        message_placeholder.markdown(full_response)
+    if not query_engine:
+        with st.chat_message("assistant"):
+            st.markdown("No indexed documents found. Please upload files first.")
+    else:
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
 
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+            streaming_response = query_engine.query(prompt)
+            for chunk in streaming_response:
+                try:
+                    new_text = chunk.raw["choices"][0]["delta"]["content"]
+                    full_response += new_text
+                    message_placeholder.markdown(full_response + "▌")
+                except:
+                    pass
+
+            message_placeholder.markdown(full_response)
+
+        st.session_state.messages.append({"role": "assistant", "content": full_response})

@@ -1,0 +1,4 @@
+.history
+hf_cache
+qdrant_storage
+__pycache__
